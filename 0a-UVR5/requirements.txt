@@ -1,0 +1,10 @@
+torch>=1.13
+onnxruntime
+librosa
+soundfile
+numpy
+ffmpeg-python
+PyYAML
+einops
+rotary_embedding_torch
+tqdm
