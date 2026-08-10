@@ -7,15 +7,16 @@ import threading
 from datetime import datetime
 
 from flask import Flask, jsonify, request, send_file
-from flask_cors import CORS
 
 from .database import (STATUS_DIRTY, STATUS_FAILED, STATUS_IDLE, STATUS_RUNNING,
-    STATUS_SUCCESS, bump_reference_version, clear_training_segments, delete_clips_by_episode, get_clip,
+    STATUS_SUCCESS, clear_training_segments, delete_clips_by_episode, get_clip,
     get_db, get_episode_stats, get_episodes, get_prototype_status,
     get_speaker_analysis, get_speaker_analysis_by_episode, get_speaker_stats,
     init_project_db, insert_clips_batch, mark_analyses_dirty,
-    mark_prototype_dirty, query_clips, scan_material_pairs, set_clip_speaker,
-    set_clip_trim, set_prototype_status, set_speaker_analysis)
+    query_clips, set_clip_speaker,
+    set_clip_trim, set_prototype_status, set_speaker_analysis, create_analysis_run,
+    finish_analysis_run, replace_auto_assignments, create_job, update_job,
+    recover_interrupted_jobs)
 from .exporter import export_gpt_sovits
 from .ffmpeg_utils import get_ffmpeg_path
 from .models import Clip
@@ -26,12 +27,15 @@ from .segments import build_review_items, build_training_segment_candidates, get
 from .database import get_training_segments, set_training_segment_status
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
-CORS(app)
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 WORKSPACE = os.path.join(ROOT, "workspace")
 VST_VERSION = "0.3"
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+_project_queues: dict[str, list[tuple]] = {}
+_running_projects: set[str] = set()
+_queue_lock = threading.Lock()
+STATUS_QUEUED = "queued"
 
 
 def _project_dir(name):
@@ -68,14 +72,52 @@ def _import_episode(directory, episode, force=False):
 
 
 def _set_job(key, **changes):
+    job_id = directory = None
     with _jobs_lock:
         _jobs.setdefault(key, {"status": STATUS_DIRTY, "step": "", "current": 0, "total": 0, "error": ""})
         _jobs[key].update(changes)
+        job_id = _jobs[key].get("job_id")
+        directory = _jobs[key].get("directory")
+    if job_id and directory:
+        update_job(directory, job_id, **changes)
 
 
-def _run_analysis(directory, speaker_id, episode, threshold):
+def _enqueue_analysis(directory, speaker_id, episode, threshold):
+    """Serialize model/GPU work per project while preserving queued jobs in SQLite."""
+    key = f"{directory}:{speaker_id}:{episode}"
+    with _queue_lock:
+        start_now = directory not in _running_projects
+        job_status = STATUS_RUNNING if start_now else STATUS_QUEUED
+        job_id = create_job(directory, "analysis", speaker_id, episode, threshold, job_status)
+        _set_job(key, status=job_status, step="开始 AI 查找" if start_now else "等待项目中的 AI 任务", current=0,
+                 total=1, job_id=job_id, directory=directory)
+        if start_now:
+            _running_projects.add(directory)
+        else:
+            _project_queues.setdefault(directory, []).append((speaker_id, episode, threshold, job_id))
+    if start_now:
+        threading.Thread(target=_run_analysis, args=(directory, speaker_id, episode, threshold, job_id), daemon=True).start()
+    return job_id, job_status
+
+
+def _start_next_project_job(directory):
+    with _queue_lock:
+        pending = _project_queues.get(directory, [])
+        if pending:
+            speaker_id, episode, threshold, job_id = pending.pop(0)
+        else:
+            _running_projects.discard(directory)
+            _project_queues.pop(directory, None)
+            return
+    key = f"{directory}:{speaker_id}:{episode}"
+    _set_job(key, status=STATUS_RUNNING, step="开始 AI 查找", current=0, total=1)
+    threading.Thread(target=_run_analysis, args=(directory, speaker_id, episode, threshold, job_id), daemon=True).start()
+
+
+def _run_analysis(directory, speaker_id, episode, threshold, job_id):
     key = f"{directory}:{speaker_id}:{episode}"
     proto_key = f"{directory}:proto:{speaker_id}"
+    analysis_run_id = None
     try:
         from .speaker.cache import build_embedding_cache, build_wav_cache
         from .speaker.prototype import build_prototype
@@ -84,6 +126,11 @@ def _run_analysis(directory, speaker_id, episode, threshold):
         episode_cfg = next((item for item in cfg.get("episodes", []) if item["name"] == episode), None)
         if not episode_cfg:
             raise ValueError("素材不存在")
+        conn = get_db(directory)
+        ref_ver_row = conn.execute("SELECT reference_version FROM speakers WHERE id=?", (speaker_id,)).fetchone()
+        conn.close()
+        ref_ver = ref_ver_row["reference_version"] if ref_ver_row else 0
+        analysis_run_id = create_analysis_run(directory, speaker_id, episode, threshold, ref_ver)
         set_speaker_analysis(directory, speaker_id, episode, threshold, 0, 0, STATUS_RUNNING)
         _set_job(key, status=STATUS_RUNNING, step="准备音频", current=0, total=1)
         _import_episode(directory, episode)
@@ -112,23 +159,18 @@ def _run_analysis(directory, speaker_id, episode, threshold):
             _set_job(proto_key, status=STATUS_SUCCESS, step="Prototype 已生成")
             mark_analyses_dirty(directory, speaker_id, reason="prototype_changed")
         results = retrieve(directory, speaker_id, episode)
-        conn = get_db(directory)
-        try:
-            conn.execute("""UPDATE training_segments SET status=?, updated_at=datetime('now', 'localtime')
-                WHERE speaker_id=? AND episode=? AND status IN ('candidate', 'approved')""",
-                ("stale", speaker_id, episode))
-            conn.execute("UPDATE clips SET selected_speaker_id=NULL WHERE selected_speaker_id=? AND episode=?", (speaker_id, episode))
-            ids = [(speaker_id, item["clip_id"]) for item in results if item["score"] >= threshold]
-            conn.executemany("UPDATE clips SET selected_speaker_id=? WHERE id=? AND selected_speaker_id IS NULL AND episode=?", [(s, c, episode) for s, c in ids])
-            conn.commit()
-        finally: conn.close()
-        selected = len(ids)
+        selected = replace_auto_assignments(directory, speaker_id, episode, threshold, results, analysis_run_id)
+        finish_analysis_run(directory, analysis_run_id, STATUS_SUCCESS)
         set_speaker_analysis(directory, speaker_id, episode, threshold, len(results), selected, STATUS_SUCCESS)
         _set_job(key, status=STATUS_SUCCESS, step="完成", current=1, total=1, result={"candidates": len(results), "selected": selected, "threshold": threshold, "episode": episode})
     except Exception as error:
+        if analysis_run_id:
+            finish_analysis_run(directory, analysis_run_id, STATUS_FAILED, str(error))
         set_speaker_analysis(directory, speaker_id, episode, threshold, 0, 0, STATUS_FAILED)
         set_prototype_status(directory, speaker_id, STATUS_FAILED)
         _set_job(key, status=STATUS_FAILED, error=str(error), step="失败")
+    finally:
+        _start_next_project_job(directory)
 
 
 @app.route("/")
@@ -165,7 +207,7 @@ def create_project_api():
 def open_project(name):
     directory = _project_or_404(name)
     if not directory: return _error("项目不存在", 404)
-    init_project_db(directory); item = _read(directory)
+    init_project_db(directory); recover_interrupted_jobs(directory); item = _read(directory)
     item.update(folder=os.path.basename(directory), project_dir=directory, episode_count=len(item.get("episodes", [])))
     return jsonify(item)
 
@@ -321,19 +363,6 @@ def trim_clip(clip_id):
     if clip.end + trim_end <= clip.start + trim_start:
         return _error("微调后的片段时长必须大于 0")
     set_clip_trim(directory, clip_id, round(trim_start, 3), round(trim_end, 3))
-    conn = get_db(directory)
-    try:
-        ref_rows = conn.execute(
-            "SELECT DISTINCT speaker_id FROM speaker_references WHERE clip_id=?", (clip_id,)
-        ).fetchall()
-    finally:
-        conn.close()
-    if ref_rows:
-        from .speaker.manager import get_speaker
-        for ref_row in ref_rows:
-            sid = ref_row["speaker_id"]
-            bump_reference_version(directory, sid)
-            mark_prototype_dirty(directory, sid)
     return jsonify({"ok": True})
 
 
@@ -439,10 +468,10 @@ def analyze(speaker_id):
     threshold = max(-1.0, min(1.0, float(data.get("threshold", 0.4))))
     key = f"{directory}:{speaker_id}:{episode}"
     with _jobs_lock:
-        if _jobs.get(key, {}).get("status") == STATUS_RUNNING: return _error("该角色正在对此素材进行 AI 查找", 409)
-    _set_job(key, status=STATUS_RUNNING, step="开始 AI 查找", current=0, total=1)
-    threading.Thread(target=_run_analysis, args=(directory, speaker_id, episode, threshold), daemon=True).start()
-    return jsonify({"ok": True})
+        if _jobs.get(key, {}).get("status") in {STATUS_RUNNING, STATUS_QUEUED}:
+            return _error("该角色正在对此素材进行 AI 查找", 409)
+    job_id, status = _enqueue_analysis(directory, speaker_id, episode, threshold)
+    return jsonify({"ok": True, "job_id": job_id, "status": status})
 
 
 @app.route("/api/speakers/<int:speaker_id>/analyze/status")
@@ -453,8 +482,13 @@ def analyze_status(speaker_id):
     analysis_key = f"{directory}:{speaker_id}:{episode}" if episode else ""
     proto_key = f"{directory}:proto:{speaker_id}"
     with _jobs_lock:
-        if analysis_key and _jobs.get(analysis_key, {}).get("status") == STATUS_RUNNING:
-            return jsonify(_jobs[analysis_key])
+        if analysis_key and _jobs.get(analysis_key, {}).get("status") in {STATUS_RUNNING, STATUS_QUEUED}:
+            job = dict(_jobs[analysis_key])
+            if job["status"] == STATUS_QUEUED:
+                # The existing UI already understands a running task; expose a
+                # queued job as busy while retaining its persisted queue state.
+                job["status"] = STATUS_RUNNING
+            return jsonify(job)
         if _jobs.get(proto_key, {}).get("status") == STATUS_RUNNING:
             return jsonify({"status": STATUS_DIRTY, "step": "Prototype 正在生成", "reason": "prototype_running"})
     saved = get_speaker_analysis_by_episode(directory, speaker_id, episode) if episode else None
@@ -593,8 +627,16 @@ def export_all(name):
 
 @app.route("/api/video")
 def video():
+    directory = _project_or_404(request.args.get("project", ""))
+    if not directory:
+        return _error("项目不存在", 404)
     path = request.args.get("path", "")
-    return send_file(path, conditional=True) if os.path.isfile(path) else _error("视频不存在", 404)
+    registered = {os.path.normcase(os.path.abspath(item.get("video", "")))
+                  for item in _read(directory).get("episodes", [])}
+    requested = os.path.normcase(os.path.abspath(path)) if path else ""
+    if requested not in registered or not os.path.isfile(requested):
+        return _error("视频不存在或不属于当前项目", 404)
+    return send_file(requested, conditional=True)
 
 
 @app.route("/api/pick-file")
@@ -622,7 +664,7 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ $d.FileName 
 
 def main():
     os.makedirs(WORKSPACE, exist_ok=True)
-    app.run(host="0.0.0.0", port=8766, debug=True, threaded=True, use_reloader=False)
+    app.run(host="127.0.0.1", port=8766, debug=False, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__": main()

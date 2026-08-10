@@ -50,7 +50,9 @@ def update_speaker(project_dir: str, speaker_id: int, name: str = None,
 
 def delete_speaker(project_dir: str, speaker_id: int):
     conn = get_db(project_dir)
-    conn.execute("UPDATE clips SET selected_speaker_id = NULL WHERE selected_speaker_id = ?", (speaker_id,))
+    # The manual decision referred to a speaker that no longer exists; release
+    # it so later analysis can make a fresh suggestion for the clip.
+    conn.execute("UPDATE clips SET selected_speaker_id = NULL, assignment_source = NULL WHERE selected_speaker_id = ?", (speaker_id,))
     conn.execute("DELETE FROM speaker_references WHERE speaker_id = ?", (speaker_id,))
     conn.execute("DELETE FROM speakers WHERE id = ?", (speaker_id,))
     conn.commit()

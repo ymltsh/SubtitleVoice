@@ -67,3 +67,12 @@ def delete_scores(project_dir: str, speaker_id: int, episode: str = ""):
         pattern = os.path.join(project_dir, "cache", "retrieval", f"speaker_{speaker_id}_*.json")
         for p in glob.glob(pattern):
             os.remove(p)
+
+
+def delete_scores_for_episode(project_dir: str, episode: str):
+    """A changed clip alters every speaker's scores for that episode."""
+    import glob
+    safe = episode.replace("/", "_").replace("\\", "_")
+    pattern = os.path.join(project_dir, "cache", "retrieval", f"speaker_*_{safe}.json")
+    for path in glob.glob(pattern):
+        os.remove(path)

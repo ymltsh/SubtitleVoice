@@ -10,10 +10,10 @@ STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_DIRTY = "dirty"
 
-_DB_VERSION = 9
+_DB_VERSION = 10
 _EXPECTED_SPEAKER_COLS = {"id", "name", "color", "created_at", "reference_version"}
 _EXPECTED_ANALYSIS_COLS = {"speaker_id", "episode", "threshold", "analyzed_at", "clip_count", "selected_count", "status", "updated_at", "reason"}
-_EXPECTED_CLIPS_COLS = {"id", "episode", "start", "end", "text", "selected_speaker_id", "trim_start", "trim_end"}
+_EXPECTED_CLIPS_COLS = {"id", "episode", "start", "end", "text", "selected_speaker_id", "assignment_source", "trim_start", "trim_end"}
 _VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".webm", ".flv", ".mov"}
 _SUB_EXTS = {".ass", ".srt", ".ssa"}
 
@@ -26,6 +26,8 @@ def get_db(project_dir: str) -> sqlite3.Connection:
     conn = sqlite3.connect(get_project_db_path(project_dir))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -46,7 +48,10 @@ def init_project_db(project_dir: str):
     conn = get_db(project_dir)
     try:
         conn.execute("BEGIN")
-        if _exists(conn, "clips") and set(_columns(conn, "clips")) != _EXPECTED_CLIPS_COLS:
+        # Only truly incompatible legacy schemas are rebuilt.  Additive changes
+        # must not discard a user's project when it is opened after an upgrade.
+        required_clip_cols = {"id", "episode", "start", "end", "text", "selected_speaker_id"}
+        if _exists(conn, "clips") and not required_clip_cols.issubset(set(_columns(conn, "clips"))):
             old_cols = set(_columns(conn, "clips"))
             selection = "selected_speaker_id" if "selected_speaker_id" in old_cols else "NULL"
             trim_s = "trim_start" if "trim_start" in old_cols else "0.0"
@@ -56,18 +61,27 @@ def init_project_db(project_dir: str):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 episode TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
                 text TEXT NOT NULL, selected_speaker_id INTEGER,
+                assignment_source TEXT,
                 trim_start REAL NOT NULL DEFAULT 0.0, trim_end REAL NOT NULL DEFAULT 0.0
             )""")
-            conn.execute(f"""INSERT INTO clips (id, episode, start, end, text, selected_speaker_id, trim_start, trim_end)
-                SELECT id, episode, start, end, text, {selection}, {trim_s}, {trim_e} FROM clips_legacy""")
+            conn.execute(f"""INSERT INTO clips (id, episode, start, end, text, selected_speaker_id, assignment_source, trim_start, trim_end)
+                SELECT id, episode, start, end, text, {selection},
+                CASE WHEN {selection} IS NULL THEN NULL ELSE 'manual' END, {trim_s}, {trim_e} FROM clips_legacy""")
             conn.execute("DROP TABLE clips_legacy")
         else:
             conn.execute("""CREATE TABLE IF NOT EXISTS clips (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 episode TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
                 text TEXT NOT NULL, selected_speaker_id INTEGER,
+                assignment_source TEXT,
                 trim_start REAL NOT NULL DEFAULT 0.0, trim_end REAL NOT NULL DEFAULT 0.0
             )""")
+        if "assignment_source" not in _columns(conn, "clips"):
+            conn.execute("ALTER TABLE clips ADD COLUMN assignment_source TEXT")
+        # Existing selections predate source tracking.  Treat them as manual so
+        # an upgrade can never erase already-reviewed work on the first re-run.
+        conn.execute("""UPDATE clips SET assignment_source='manual'
+            WHERE selected_speaker_id IS NOT NULL AND assignment_source IS NULL""")
 
         if _exists(conn, "speakers") and set(_columns(conn, "speakers")) != _EXPECTED_SPEAKER_COLS:
             old_cols = set(_columns(conn, "speakers"))
@@ -118,6 +132,42 @@ def init_project_db(project_dir: str):
             updated_at TEXT,
             FOREIGN KEY (speaker_id) REFERENCES speakers(id) ON DELETE CASCADE
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS analysis_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            speaker_id INTEGER NOT NULL,
+            episode TEXT NOT NULL,
+            threshold REAL NOT NULL,
+            prototype_version INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            completed_at TEXT,
+            error TEXT,
+            FOREIGN KEY (speaker_id) REFERENCES speakers(id) ON DELETE CASCADE
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS clip_predictions (
+            analysis_run_id INTEGER NOT NULL,
+            clip_id INTEGER NOT NULL,
+            score REAL NOT NULL,
+            PRIMARY KEY (analysis_run_id, clip_id),
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            speaker_id INTEGER,
+            episode TEXT,
+            threshold REAL,
+            status TEXT NOT NULL,
+            step TEXT NOT NULL DEFAULT '',
+            current INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
+            result_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY (speaker_id) REFERENCES speakers(id) ON DELETE CASCADE
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS training_segments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             speaker_id INTEGER NOT NULL,
@@ -144,6 +194,8 @@ def init_project_db(project_dir: str):
             FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clips_episode_speaker ON clips(episode, selected_speaker_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_clip ON clip_predictions(clip_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, kind)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_training_segments_speaker_episode ON training_segments(speaker_id, episode, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_training_segment_clips_clip ON training_segment_clips(clip_id)")
         conn.execute("DROP TABLE IF EXISTS predictions")
@@ -167,11 +219,20 @@ def insert_clips_batch(project_dir: str, clips: list[Clip]) -> int:
 def set_clip_trim(project_dir: str, clip_id: int, trim_start: float, trim_end: float):
     conn = get_db(project_dir)
     try:
+        row = conn.execute("SELECT episode FROM clips WHERE id=?", (clip_id,)).fetchone()
+        references = conn.execute("SELECT speaker_id FROM speaker_references WHERE clip_id=?", (clip_id,)).fetchall()
         conn.execute("UPDATE clips SET trim_start=?, trim_end=? WHERE id=?", (trim_start, trim_end, clip_id))
         _mark_training_segments_stale_for_clip(conn, clip_id)
+        for reference in references:
+            conn.execute("UPDATE speakers SET reference_version=reference_version+1 WHERE id=?", (reference["speaker_id"],))
         conn.commit()
     finally:
         conn.close()
+    if row:
+        _invalidate_clip_media(project_dir, clip_id, row["episode"])
+        mark_episode_analyses_dirty(project_dir, row["episode"], "clip_trimmed")
+    for reference in references:
+        _invalidate_speaker_prototype(project_dir, reference["speaker_id"])
 
 
 def get_clip(project_dir: str, clip_id: int) -> Optional[Clip]:
@@ -214,7 +275,9 @@ def query_clips(project_dir: str, speaker_id: Optional[int] = None, episode: str
 def set_clip_speaker(project_dir: str, clip_id: int, speaker_id: Optional[int]):
     conn = get_db(project_dir)
     try:
-        conn.execute("UPDATE clips SET selected_speaker_id=? WHERE id=?", (speaker_id, clip_id))
+        # A blank manual choice is a deliberate rejection, not an invitation for
+        # the next AI run to put the clip back.
+        conn.execute("UPDATE clips SET selected_speaker_id=?, assignment_source='manual' WHERE id=?", (speaker_id, clip_id))
         _mark_training_segments_stale_for_clip(conn, clip_id)
         conn.commit()
     finally: conn.close()
@@ -223,11 +286,17 @@ def set_clip_speaker(project_dir: str, clip_id: int, speaker_id: Optional[int]):
 def delete_clips_by_episode(project_dir: str, episode: str):
     conn = get_db(project_dir)
     try:
+        clip_ids = [row["id"] for row in conn.execute("SELECT id FROM clips WHERE episode=?", (episode,)).fetchall()]
+        references = conn.execute("""SELECT DISTINCT speaker_id FROM speaker_references
+            WHERE clip_id IN (SELECT id FROM clips WHERE episode=?)""", (episode,)).fetchall()
         conn.execute("DELETE FROM training_segments WHERE episode=?", (episode,))
         conn.execute("DELETE FROM clips WHERE episode=?", (episode,))
         conn.execute("DELETE FROM speaker_analysis WHERE episode=?", (episode,))
         conn.commit()
     finally: conn.close()
+    _invalidate_episode_media(project_dir, episode, clip_ids)
+    for reference in references:
+        _bump_and_invalidate_speaker(project_dir, reference["speaker_id"])
 
 
 def get_episodes(project_dir: str) -> list[str]:
@@ -355,6 +424,164 @@ def mark_analyses_dirty(project_dir: str, speaker_id: int, reason: str = "protot
         conn.execute("""UPDATE speaker_analysis SET status=?, updated_at=datetime('now', 'localtime'), reason=?
             WHERE speaker_id=? AND status=?""",
             (STATUS_DIRTY, reason, speaker_id, STATUS_SUCCESS))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_episode_analyses_dirty(project_dir: str, episode: str, reason: str = "episode_changed"):
+    """Mark every completed analysis for changed episode audio as stale."""
+    conn = get_db(project_dir)
+    try:
+        conn.execute("""UPDATE speaker_analysis SET status=?, updated_at=datetime('now', 'localtime'), reason=?
+            WHERE episode=? AND status=?""", (STATUS_DIRTY, reason, episode, STATUS_SUCCESS))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _invalidate_clip_media(project_dir: str, clip_id: int, episode: str):
+    from .speaker.cache import CacheInvalidator
+    CacheInvalidator(project_dir).invalidate_clip(clip_id, episode)
+
+
+def _invalidate_episode_media(project_dir: str, episode: str, clip_ids: list[int] | None = None):
+    from .speaker.cache import CacheInvalidator
+    CacheInvalidator(project_dir).invalidate_episode(episode, clip_ids)
+
+
+def _invalidate_speaker_prototype(project_dir: str, speaker_id: int):
+    from .speaker.prototype import delete_prototype
+    delete_prototype(project_dir, speaker_id)
+    mark_prototype_dirty(project_dir, speaker_id)
+
+
+def _bump_and_invalidate_speaker(project_dir: str, speaker_id: int):
+    bump_reference_version(project_dir, speaker_id)
+    _invalidate_speaker_prototype(project_dir, speaker_id)
+
+
+def create_analysis_run(project_dir: str, speaker_id: int, episode: str, threshold: float,
+                        prototype_version: int) -> int:
+    conn = get_db(project_dir)
+    try:
+        cur = conn.execute("""INSERT INTO analysis_runs
+            (speaker_id, episode, threshold, prototype_version, status) VALUES (?, ?, ?, ?, ?)""",
+            (speaker_id, episode, threshold, prototype_version, STATUS_RUNNING))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def finish_analysis_run(project_dir: str, run_id: int, status: str, error: str = ""):
+    conn = get_db(project_dir)
+    try:
+        conn.execute("""UPDATE analysis_runs SET status=?, completed_at=datetime('now', 'localtime'), error=?
+            WHERE id=?""", (status, error, run_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def replace_auto_assignments(project_dir: str, speaker_id: int, episode: str,
+                             threshold: float, results: list[dict], analysis_run_id: int) -> int:
+    """Persist predictions and refresh only this speaker's prior AI suggestions.
+
+    Rows marked ``manual`` are final human keep/reject decisions, including a
+    manual rejection with a NULL speaker id, and are never modified here.
+    """
+    conn = get_db(project_dir)
+    try:
+        conn.execute("BEGIN")
+        conn.executemany("INSERT OR REPLACE INTO clip_predictions (analysis_run_id, clip_id, score) VALUES (?, ?, ?)",
+                         [(analysis_run_id, item["clip_id"], item["score"]) for item in results])
+        conn.execute("""UPDATE training_segments SET status=?, updated_at=datetime('now', 'localtime')
+            WHERE speaker_id=? AND episode=? AND status IN ('candidate', 'approved')""",
+                     ("stale", speaker_id, episode))
+        conn.execute("""UPDATE clips SET selected_speaker_id=NULL, assignment_source=NULL
+            WHERE episode=? AND selected_speaker_id=? AND assignment_source='auto'""",
+                     (episode, speaker_id))
+        candidates = [item for item in results if item["score"] >= threshold]
+        for item in candidates:
+            conn.execute("""UPDATE clips SET selected_speaker_id=?, assignment_source='auto'
+                WHERE id=? AND episode=? AND COALESCE(assignment_source, 'auto') <> 'manual'
+                AND (selected_speaker_id IS NULL OR (selected_speaker_id=? AND assignment_source='auto'))""",
+                         (speaker_id, item["clip_id"], episode, speaker_id))
+        conn.commit()
+        return len(candidates)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def create_job(project_dir: str, kind: str, speaker_id: int, episode: str, threshold: float,
+               status: str = STATUS_RUNNING) -> int:
+    conn = get_db(project_dir)
+    try:
+        cur = conn.execute("""INSERT INTO jobs(kind, speaker_id, episode, threshold, status)
+            VALUES (?, ?, ?, ?, ?)""", (kind, speaker_id, episode, threshold, status))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_job(project_dir: str, job_id: int, **changes):
+    allowed = {"status", "step", "current", "total", "error", "result_json"}
+    values = {key: value for key, value in changes.items() if key in allowed}
+    if not values:
+        return
+    if "result" in changes:
+        import json
+        values["result_json"] = json.dumps(changes["result"], ensure_ascii=False)
+    assignments = ", ".join(f"{field}=?" for field in values)
+    conn = get_db(project_dir)
+    try:
+        conn.execute(f"UPDATE jobs SET {assignments}, updated_at=datetime('now', 'localtime') WHERE id=?",
+                     [*values.values(), job_id])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_job(project_dir: str, job_id: int) -> dict | None:
+    conn = get_db(project_dir)
+    try:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        import json
+        item["result"] = json.loads(item.pop("result_json") or "null")
+        return item
+    finally:
+        conn.close()
+
+
+def has_running_job(project_dir: str) -> bool:
+    conn = get_db(project_dir)
+    try:
+        return conn.execute("SELECT 1 FROM jobs WHERE status=? LIMIT 1", (STATUS_RUNNING,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def recover_interrupted_jobs(project_dir: str):
+    """A daemon thread cannot survive process exit; leave an auditable outcome."""
+    conn = get_db(project_dir)
+    try:
+        interrupted = conn.execute("SELECT speaker_id, episode FROM jobs WHERE status IN (?, ?)", (STATUS_RUNNING, "queued")).fetchall()
+        conn.execute("""UPDATE jobs SET status=?, step=?, error=?, updated_at=datetime('now', 'localtime')
+            WHERE status IN (?, ?)""", (STATUS_FAILED, "服务已重启", "任务被服务重启中断", STATUS_RUNNING, "queued"))
+        for job in interrupted:
+            conn.execute("""UPDATE speaker_analysis SET status=?, reason=?, updated_at=datetime('now', 'localtime')
+                WHERE speaker_id=? AND episode=? AND status=?""",
+                         (STATUS_FAILED, "任务被服务重启中断", job["speaker_id"], job["episode"], STATUS_RUNNING))
+        conn.execute("""UPDATE analysis_runs SET status=?, error=?, completed_at=datetime('now', 'localtime')
+            WHERE status=?""", (STATUS_FAILED, "任务被服务重启中断", STATUS_RUNNING))
         conn.commit()
     finally:
         conn.close()

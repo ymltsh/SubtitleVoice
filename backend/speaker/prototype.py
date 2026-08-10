@@ -76,7 +76,7 @@ def get_prototype(project_dir: str, speaker_id: int):
     path = _prototype_path(project_dir, speaker_id)
     if not os.path.isfile(path):
         return None
-    return np.load(path)
+    return np.load(path, allow_pickle=False)
 
 
 def has_prototype(project_dir: str, speaker_id: int) -> bool:
