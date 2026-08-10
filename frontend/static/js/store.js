@@ -14,8 +14,8 @@ const STATUS_DIRTY = "dirty";
 const { reactive } = Vue;
 const store = reactive({
   projects: [], project: null, episodes: [], speakers: [], currentEpisode: "", currentSpeakerId: null,
-  clips: [], page: 1, total: 0, pages: 1, keyword: "", selectedFilter: "", threshold: 40,
-  references: [], analyses: {}, prototypeStatus: null, exportSummary: null, batchSummary: null,
+  clips: [], reviewItems: [], page: 1, total: 0, totalClips: 0, pages: 1, keyword: "", selectedFilter: "", threshold: 40,
+  references: [], trainingSegments: [], analyses: {}, prototypeStatus: null, exportSummary: null, batchSummary: null,
   exportDialog: false, batchExportDialog: false, exportMenuOpen: false, toast: "", newProject: false, addEpisodeDialog: false, newSpeaker: false,
   exportLanguage: "ZH",
   skipShortClips: false,
@@ -65,7 +65,7 @@ const store = reactive({
       ep.analysis_status = stat ? stat.analysis_status : STATUS_IDLE;
       ep.analyzed = stat ? !!stat.analyzed : false;
     }
-    if (this.currentSpeakerId) await this.loadReferences();
+    if (this.currentSpeakerId) { await this.loadReferences(); await this.loadTrainingSegments(); }
     await this.loadClips();
   },
   async addEpisode() {
@@ -88,14 +88,36 @@ const store = reactive({
     }
   },
   async chooseSpeaker(id) { this.currentSpeakerId = id; this.page = 1; await this.refresh(); await this.loadPrototypeStatus(); await this.loadAnalysis(); },
-  async switchEpisode(name) { this.currentEpisode = name; this.page = 1; await this.loadClips(); await this.loadPrototypeStatus(); await this.loadAnalysis(); },
+  async switchEpisode(name) { this.currentEpisode = name; this.page = 1; await this.loadClips(); await this.loadPrototypeStatus(); await this.loadAnalysis(); await this.loadTrainingSegments(); },
   async loadReferences() { if (this.currentSpeakerId) this.references = await api(`/api/speakers/${this.currentSpeakerId}/references?project=${encodeURIComponent(this.pid)}`); else this.references = []; },
+  async loadTrainingSegments() {
+    if (!this.currentSpeakerId || !this.currentEpisode) { this.trainingSegments = []; return; }
+    this.trainingSegments = await api(`/api/speakers/${this.currentSpeakerId}/training-segments?project=${encodeURIComponent(this.pid)}&episode=${encodeURIComponent(this.currentEpisode)}`);
+  },
+  async generateTrainingSegments(regenerate = false) {
+    if (!this.currentSpeakerId || !this.currentEpisode) return;
+    if (regenerate && !confirm("重新生成当前素材的合并建议？\n\n现有待确认建议将被替换；已采用的合并段不会受影响。")) return;
+    const result = await api(`/api/speakers/${this.currentSpeakerId}/training-segments/generate`, {
+      method: "POST", body: JSON.stringify({ project: this.pid, episode: this.currentEpisode, min_duration: 3, max_duration: 10, max_gap: 0.35 })
+    });
+    await this.loadTrainingSegments();
+    this.tell(result.created ? `已${regenerate ? "重新" : ""}生成 ${result.created} 个 3–10 秒合并建议` : "没有找到可安全合并为 3 秒以上的连续片段");
+  },
+  async updateTrainingSegmentStatus(segment, status) {
+    await api(`/api/training-segments/${segment.id}/status`, { method: "PATCH", body: JSON.stringify({ project: this.pid, status }) });
+    await this.loadTrainingSegments();
+    await this.loadClips();
+    this.tell(status === "approved" ? "已采用合并训练片段，导出时会替代组成 Clip" : status === "candidate" ? "已取消采用，Clip 已恢复独立展示" : "已忽略该合并建议");
+  },
   async loadClips() {
     if (!this.pid) return;
     const q = new URLSearchParams({ project: this.pid, page: this.page, limit: 100 });
     if (this.currentEpisode) q.set("episode", this.currentEpisode); if (this.currentSpeakerId) q.set("speaker", this.currentSpeakerId);
     if (this.keyword) q.set("keyword", this.keyword); if (this.selectedFilter) q.set("selected", this.selectedFilter);
-    const data = await api(`/api/clips?${q}`); this.clips = data.clips; this.total = data.total; this.pages = data.total_pages;
+    const data = await api(`/api/review-items?${q}`);
+    this.reviewItems = data.items;
+    this.clips = data.items.flatMap(item => item.type === "segment" ? item.clips : [item.clip]);
+    this.total = data.total; this.totalClips = data.total_clips; this.pages = data.total_pages;
     if (this.page > this.pages && this.pages > 0) { this.page = this.pages; return this.loadClips(); }
   },
   goPage(page) {
@@ -182,20 +204,24 @@ const store = reactive({
     this.tell(msg);
   },
   async deleteSpeaker() { if (confirm("删除该角色及其参考素材？")) { await api(`/api/speakers/${this.currentSpeakerId}?project=${encodeURIComponent(this.pid)}`, { method: "DELETE" }); this.currentSpeakerId = null; this.prototypeStatus = null; await this.refresh(); } },
+  playRange(start, end) {
+    const video = document.querySelector("video");
+    if (!video) return;
+    if (this.playStopTimer) clearInterval(this.playStopTimer);
+    video.currentTime = start;
+    video.play();
+    this.playStopTimer = setInterval(() => {
+      if (video.currentTime >= end) { video.pause(); clearInterval(this.playStopTimer); this.playStopTimer = null; }
+    }, 80);
+  },
   play(clip) {
     const editing = this.clipEdit.id === clip.id ? this.clipEdit : null;
     const effStart = editing ? (clip.start + editing.trim_start) : (clip.effective_start || clip.start);
     const effEnd = editing ? (clip.end + editing.trim_end) : (clip.effective_end || clip.end);
     this.activeClip = clip.id;
-    const video = document.querySelector("video");
-    if (!video) return;
-    if (this.playStopTimer) clearInterval(this.playStopTimer);
-    video.currentTime = effStart;
-    video.play();
-    this.playStopTimer = setInterval(() => {
-      if (video.currentTime >= effEnd) { video.pause(); clearInterval(this.playStopTimer); this.playStopTimer = null; }
-    }, 80);
+    this.playRange(effStart, effEnd);
   },
+  playTrainingSegment(segment) { this.activeClip = null; this.playRange(segment.start, segment.end); },
   startTrimEdit(clip) {
     this.clipEdit = { id: clip.id, trim_start: clip.trim_start || 0, trim_end: clip.trim_end || 0 };
   },
@@ -230,6 +256,8 @@ const store = reactive({
     this.tell("Trim 已保存");
     await this.loadPrototypeStatus();
     await this.loadReferences();
+    await this.loadTrainingSegments();
+    await this.loadClips();
   },
   async resetTrim() {
     this.clipEdit.trim_start = 0;

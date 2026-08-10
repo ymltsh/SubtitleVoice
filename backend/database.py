@@ -10,7 +10,7 @@ STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_DIRTY = "dirty"
 
-_DB_VERSION = 8
+_DB_VERSION = 9
 _EXPECTED_SPEAKER_COLS = {"id", "name", "color", "created_at", "reference_version"}
 _EXPECTED_ANALYSIS_COLS = {"speaker_id", "episode", "threshold", "analyzed_at", "clip_count", "selected_count", "status", "updated_at", "reason"}
 _EXPECTED_CLIPS_COLS = {"id", "episode", "start", "end", "text", "selected_speaker_id", "trim_start", "trim_end"}
@@ -118,6 +118,34 @@ def init_project_db(project_dir: str):
             updated_at TEXT,
             FOREIGN KEY (speaker_id) REFERENCES speakers(id) ON DELETE CASCADE
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS training_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            speaker_id INTEGER NOT NULL,
+            episode TEXT NOT NULL,
+            start REAL NOT NULL,
+            end REAL NOT NULL,
+            text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'candidate',
+            origin TEXT NOT NULL DEFAULT 'auto',
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY (speaker_id) REFERENCES speakers(id) ON DELETE CASCADE,
+            CHECK (end > start),
+            CHECK (status IN ('candidate', 'approved', 'rejected', 'stale')),
+            CHECK (origin IN ('auto', 'manual'))
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS training_segment_clips (
+            segment_id INTEGER NOT NULL,
+            clip_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            PRIMARY KEY (segment_id, clip_id),
+            UNIQUE (segment_id, position),
+            FOREIGN KEY (segment_id) REFERENCES training_segments(id) ON DELETE CASCADE,
+            FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_clips_episode_speaker ON clips(episode, selected_speaker_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_training_segments_speaker_episode ON training_segments(speaker_id, episode, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_training_segment_clips_clip ON training_segment_clips(clip_id)")
         conn.execute("DROP TABLE IF EXISTS predictions")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('db_version', ?)", (str(_DB_VERSION),))
@@ -140,6 +168,7 @@ def set_clip_trim(project_dir: str, clip_id: int, trim_start: float, trim_end: f
     conn = get_db(project_dir)
     try:
         conn.execute("UPDATE clips SET trim_start=?, trim_end=? WHERE id=?", (trim_start, trim_end, clip_id))
+        _mark_training_segments_stale_for_clip(conn, clip_id)
         conn.commit()
     finally:
         conn.close()
@@ -185,13 +214,16 @@ def query_clips(project_dir: str, speaker_id: Optional[int] = None, episode: str
 def set_clip_speaker(project_dir: str, clip_id: int, speaker_id: Optional[int]):
     conn = get_db(project_dir)
     try:
-        conn.execute("UPDATE clips SET selected_speaker_id=? WHERE id=?", (speaker_id, clip_id)); conn.commit()
+        conn.execute("UPDATE clips SET selected_speaker_id=? WHERE id=?", (speaker_id, clip_id))
+        _mark_training_segments_stale_for_clip(conn, clip_id)
+        conn.commit()
     finally: conn.close()
 
 
 def delete_clips_by_episode(project_dir: str, episode: str):
     conn = get_db(project_dir)
     try:
+        conn.execute("DELETE FROM training_segments WHERE episode=?", (episode,))
         conn.execute("DELETE FROM clips WHERE episode=?", (episode,))
         conn.execute("DELETE FROM speaker_analysis WHERE episode=?", (episode,))
         conn.commit()
@@ -324,5 +356,75 @@ def mark_analyses_dirty(project_dir: str, speaker_id: int, reason: str = "protot
             WHERE speaker_id=? AND status=?""",
             (STATUS_DIRTY, reason, speaker_id, STATUS_SUCCESS))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _mark_training_segments_stale_for_clip(conn, clip_id: int):
+    conn.execute("""UPDATE training_segments SET status=?, updated_at=datetime('now', 'localtime')
+        WHERE status IN ('candidate', 'approved') AND id IN (
+            SELECT segment_id FROM training_segment_clips WHERE clip_id=?
+        )""", ("stale", clip_id))
+
+
+def replace_auto_training_segments(project_dir: str, speaker_id: int, episode: str,
+                                   segments: list[dict]) -> int:
+    """Replace only pending automatic suggestions; approved history remains intact."""
+    conn = get_db(project_dir)
+    try:
+        conn.execute("DELETE FROM training_segments WHERE speaker_id=? AND episode=? AND origin='auto' AND status='candidate'",
+                     (speaker_id, episode))
+        valid_segments = [segment for segment in segments if len(segment["clip_ids"]) >= 2]
+        for segment in valid_segments:
+            cur = conn.execute("""INSERT INTO training_segments
+                (speaker_id, episode, start, end, text, status, origin)
+                VALUES (?, ?, ?, ?, ?, 'candidate', 'auto')""",
+                (speaker_id, episode, segment["start"], segment["end"], segment["text"]))
+            conn.executemany("INSERT INTO training_segment_clips(segment_id, clip_id, position) VALUES (?, ?, ?)",
+                             [(cur.lastrowid, clip_id, pos) for pos, clip_id in enumerate(segment["clip_ids"])])
+        conn.commit()
+        return len(valid_segments)
+    finally:
+        conn.close()
+
+
+def get_training_segments(project_dir: str, speaker_id: int, episode: str = "") -> list[dict]:
+    conn = get_db(project_dir)
+    try:
+        where, params = ["ts.speaker_id=?"], [speaker_id]
+        if episode:
+            where.append("ts.episode=?")
+            params.append(episode)
+        rows = conn.execute(f"""SELECT ts.*,
+            (SELECT COUNT(*) FROM training_segment_clips tsc WHERE tsc.segment_id=ts.id) AS clip_count,
+            (SELECT GROUP_CONCAT(clip_id, ',') FROM (
+                SELECT clip_id FROM training_segment_clips WHERE segment_id=ts.id ORDER BY position
+            )) AS clip_ids
+            FROM training_segments ts WHERE {' AND '.join(where)}
+            ORDER BY ts.episode, ts.start, ts.id""", params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["clip_ids"] = [int(value) for value in item["clip_ids"].split(",")] if item["clip_ids"] else []
+            item["duration"] = round(item["end"] - item["start"], 3)
+            result.append(item)
+        return result
+    finally:
+        conn.close()
+
+
+def set_training_segment_status(project_dir: str, segment_id: int, status: str) -> bool:
+    if status not in {"candidate", "approved", "rejected"}:
+        raise ValueError("无效的训练片段状态")
+    conn = get_db(project_dir)
+    try:
+        previous = "approved" if status == "candidate" else "candidate"
+        single_clip_guard = "" if status == "candidate" else """AND (
+            SELECT COUNT(*) FROM training_segment_clips WHERE segment_id=training_segments.id
+        ) >= 2"""
+        cur = conn.execute(f"""UPDATE training_segments SET status=?, updated_at=datetime('now', 'localtime')
+            WHERE id=? AND status=? {single_clip_guard}""", (status, segment_id, previous))
+        conn.commit()
+        return cur.rowcount == 1
     finally:
         conn.close()

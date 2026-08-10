@@ -22,6 +22,8 @@ from .models import Clip
 from .parser import parse_subtitle
 from .speaker.manager import (add_reference, create_speaker, delete_speaker,
     get_references, get_speaker, get_speakers, remove_reference)
+from .segments import build_review_items, build_training_segment_candidates, get_export_items
+from .database import get_training_segments, set_training_segment_status
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 CORS(app)
@@ -112,6 +114,9 @@ def _run_analysis(directory, speaker_id, episode, threshold):
         results = retrieve(directory, speaker_id, episode)
         conn = get_db(directory)
         try:
+            conn.execute("""UPDATE training_segments SET status=?, updated_at=datetime('now', 'localtime')
+                WHERE speaker_id=? AND episode=? AND status IN ('candidate', 'approved')""",
+                ("stale", speaker_id, episode))
             conn.execute("UPDATE clips SET selected_speaker_id=NULL WHERE selected_speaker_id=? AND episode=?", (speaker_id, episode))
             ids = [(speaker_id, item["clip_id"]) for item in results if item["score"] >= threshold]
             conn.executemany("UPDATE clips SET selected_speaker_id=? WHERE id=? AND selected_speaker_id IS NULL AND episode=?", [(s, c, episode) for s, c in ids])
@@ -255,6 +260,43 @@ def clips():
     return jsonify({"clips": rows[(page-1)*limit:page*limit], "total": total, "page": page, "limit": limit, "total_pages": max(1, (total + limit - 1) // limit)})
 
 
+def _add_clip_display_fields(row, scores: dict, speaker_id: int | None):
+    row["score"] = scores.get(row["id"]) if speaker_id else None
+    es = row["start"] + row.get("trim_start", 0.0)
+    ee = row["end"] + row.get("trim_end", 0.0)
+    row["effective_start"] = round(es, 3)
+    row["effective_end"] = round(ee, 3)
+    row["duration"] = round(ee - es, 3)
+
+
+@app.route("/api/review-items")
+def review_items():
+    directory = _project_or_404(request.args.get("project", ""))
+    if not directory: return _error("项目不存在", 404)
+    speaker = request.args.get("speaker", type=int)
+    selected_arg = request.args.get("selected")
+    selected = None if selected_arg not in ("true", "false") else selected_arg == "true"
+    items, total_clips = build_review_items(directory, speaker, request.args.get("episode", ""),
+                                            request.args.get("keyword", ""), selected)
+    scores = {}
+    if speaker:
+        from .speaker.retrieval import get_scores
+        scores = get_scores(directory, speaker, request.args.get("episode", ""))
+    for item in items:
+        if item["type"] == "segment":
+            for row in item["clips"]:
+                _add_clip_display_fields(row, scores, speaker)
+        else:
+            _add_clip_display_fields(item["clip"], scores, speaker)
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(500, max(1, request.args.get("limit", 100, type=int)))
+    total = len(items)
+    return jsonify({
+        "items": items[(page-1)*limit:page*limit], "total": total, "total_clips": total_clips,
+        "page": page, "limit": limit, "total_pages": max(1, (total + limit - 1) // limit),
+    })
+
+
 @app.route("/api/clips/<int:clip_id>/selection", methods=["PATCH"])
 def select_clip(clip_id):
     data = request.get_json() or {}; directory = _project_or_404(data.get("project", ""))
@@ -276,6 +318,8 @@ def trim_clip(clip_id):
     trim_end = float(data.get("trim_end", 0))
     trim_start = max(-2.0, min(2.0, trim_start))
     trim_end = max(-2.0, min(2.0, trim_end))
+    if clip.end + trim_end <= clip.start + trim_start:
+        return _error("微调后的片段时长必须大于 0")
     set_clip_trim(directory, clip_id, round(trim_start, 3), round(trim_end, 3))
     conn = get_db(directory)
     try:
@@ -291,6 +335,47 @@ def trim_clip(clip_id):
             bump_reference_version(directory, sid)
             mark_prototype_dirty(directory, sid)
     return jsonify({"ok": True})
+
+
+@app.route("/api/speakers/<int:speaker_id>/training-segments")
+def training_segments(speaker_id):
+    directory = _project_or_404(request.args.get("project", ""))
+    if not directory: return _error("项目不存在", 404)
+    if not get_speaker(directory, speaker_id): return _error("角色不存在", 404)
+    return jsonify(get_training_segments(directory, speaker_id, request.args.get("episode", "")))
+
+
+@app.route("/api/speakers/<int:speaker_id>/training-segments/generate", methods=["POST"])
+def generate_training_segments(speaker_id):
+    data = request.get_json() or {}
+    directory = _project_or_404(data.get("project", ""))
+    if not directory: return _error("项目不存在", 404)
+    if not get_speaker(directory, speaker_id): return _error("角色不存在", 404)
+    episode = str(data.get("episode", "")).strip()
+    if not episode or not _episode_config(directory, episode): return _error("请指定有效素材")
+    try:
+        result = build_training_segment_candidates(
+            directory, speaker_id, episode,
+            float(data.get("min_duration", 3.0)),
+            float(data.get("max_duration", 10.0)),
+            float(data.get("max_gap", 0.35)),
+        )
+        return jsonify(result)
+    except ValueError as error:
+        return _error(str(error))
+
+
+@app.route("/api/training-segments/<int:segment_id>/status", methods=["PATCH"])
+def update_training_segment_status(segment_id):
+    data = request.get_json() or {}
+    directory = _project_or_404(data.get("project", ""))
+    if not directory: return _error("项目不存在", 404)
+    try:
+        if not set_training_segment_status(directory, segment_id, data.get("status", "")):
+            return _error("训练片段不存在", 404)
+        return jsonify({"ok": True})
+    except ValueError as error:
+        return _error(str(error))
 
 
 @app.route("/api/speakers", methods=["GET", "POST"])
@@ -379,7 +464,7 @@ def export_speaker(speaker_id):
     speaker_obj = get_speaker(directory, speaker_id)
     if not speaker_obj: return _error("角色不存在", 404)
     require_success = data.get("require_success", False)
-    rows = [Clip(**row) for row in query_clips(directory, speaker_id=speaker_id, selected=True)]
+    rows = get_export_items(directory, speaker_id)
     exported_eps = []; skipped_eps = []
     if require_success:
         analyses = get_speaker_analysis(directory)
@@ -411,13 +496,14 @@ def export_summary(speaker_id):
     speaker_obj = get_speaker(directory, speaker_id)
     if not speaker_obj: return _error("角色不存在", 404)
     analyses = get_speaker_analysis(directory)
+    export_items = get_export_items(directory, speaker_id)
     ep_analyses = {a["episode"]: a for a in analyses if a["speaker_id"] == speaker_id}
     episodes = []; total = 0; success_total = 0; dirty_total = 0
     for ep_cfg in _read(directory).get("episodes", []):
         ep_name = ep_cfg["name"]
         a = ep_analyses.get(ep_name, {})
         status = a.get("status", STATUS_IDLE)
-        selected = sum(1 for _ in query_clips(directory, speaker_id=speaker_id, episode=ep_name, selected=True))
+        selected = sum(1 for item in export_items if item.episode == ep_name)
         episodes.append({"episode": ep_name, "status": status, "selected_count": selected})
         total += selected
         if status == STATUS_SUCCESS: success_total += selected
@@ -440,12 +526,13 @@ def batch_export_summary(name):
     result = []; total_clips = 0
     for s in speakers:
         ep_analyses = {a["episode"]: a for a in analyses if a["speaker_id"] == s["id"]}
+        export_items = get_export_items(directory, s["id"])
         episodes = []; sp_total = 0; sp_success = 0; sp_dirty = 0
         for ep_cfg in _read(directory).get("episodes", []):
             ep_name = ep_cfg["name"]
             a = ep_analyses.get(ep_name, {})
             status = a.get("status", STATUS_IDLE)
-            selected = sum(1 for _ in query_clips(directory, speaker_id=s["id"], episode=ep_name, selected=True))
+            selected = sum(1 for item in export_items if item.episode == ep_name)
             episodes.append({"episode": ep_name, "status": status, "selected_count": selected})
             sp_total += selected
             if status == STATUS_SUCCESS: sp_success += selected
@@ -468,11 +555,12 @@ def export_all(name):
     data = request.get_json() or {}
     require_success = data.get("require_success", False)
     language = (data.get("language") or "ZH").strip().upper()
+    skip_short = bool(data.get("skip_short", False))
     speakers = get_speakers(directory)
     analyses = get_speaker_analysis(directory)
     results = []; total_wavs = 0
     for s in speakers:
-        rows = [Clip(**row) for row in query_clips(directory, speaker_id=s["id"], selected=True)]
+        rows = get_export_items(directory, s["id"])
         skipped = []
         if require_success:
             success_eps = {a["episode"] for a in analyses if a["speaker_id"] == s["id"] and a["status"] == STATUS_SUCCESS}
@@ -485,7 +573,7 @@ def export_all(name):
             output = os.path.join(directory, "export", re.sub(r'[<>:"/\\|?*]', "_", s["name"]))
             ep_videos = {item["name"]: item["video"] for item in _read(directory).get("episodes", [])}
             r = export_gpt_sovits(directory, exported_rows, output, ep_videos, language=language, skip_short=skip_short)
-            results.append({"speaker": s["name"], "wav_count": r["wav_count"], "error_count": r.get("error_count", 0), "skipped_episodes": skipped, "output_dir": r["output_dir"]})
+            results.append({"speaker": s["name"], "wav_count": r["wav_count"], "error_count": r.get("error_count", 0), "skipped_short": r.get("skipped_short", 0), "skipped_episodes": skipped, "output_dir": r["output_dir"]})
             total_wavs += r["wav_count"]
         else:
             results.append({"speaker": s["name"], "wav_count": 0, "skipped_episodes": skipped, "output_dir": None})

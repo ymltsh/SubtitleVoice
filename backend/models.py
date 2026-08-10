@@ -42,6 +42,29 @@ class Clip:
 
 
 @dataclass
+class ExportItem:
+    """A final audio range to export, sourced from either one Clip or a segment."""
+
+    id: str = ""
+    episode: str = ""
+    start: float = 0.0
+    end: float = 0.0
+    text: str = ""
+
+    @property
+    def effective_start(self) -> float:
+        return self.start
+
+    @property
+    def effective_end(self) -> float:
+        return self.end
+
+    @property
+    def effective_duration(self) -> float:
+        return self.end - self.start
+
+
+@dataclass
 class SubtitleLine:
     id: int
     start: float
