@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
 from .database import (STATUS_DIRTY, STATUS_FAILED, STATUS_IDLE, STATUS_RUNNING,
-    STATUS_SUCCESS, bump_reference_version, delete_clips_by_episode, get_clip,
+    STATUS_SUCCESS, bump_reference_version, clear_training_segments, delete_clips_by_episode, get_clip,
     get_db, get_episode_stats, get_episodes, get_prototype_status,
     get_speaker_analysis, get_speaker_analysis_by_episode, get_speaker_stats,
     init_project_db, insert_clips_batch, mark_analyses_dirty,
@@ -363,6 +363,17 @@ def generate_training_segments(speaker_id):
         return jsonify(result)
     except ValueError as error:
         return _error(str(error))
+
+
+@app.route("/api/speakers/<int:speaker_id>/training-segments", methods=["DELETE"])
+def clear_speaker_training_segments(speaker_id):
+    data = request.get_json() or {}
+    directory = _project_or_404(data.get("project", ""))
+    if not directory: return _error("项目不存在", 404)
+    if not get_speaker(directory, speaker_id): return _error("角色不存在", 404)
+    episode = str(data.get("episode", "")).strip()
+    if not episode or not _episode_config(directory, episode): return _error("请指定有效素材")
+    return jsonify({"deleted": clear_training_segments(directory, speaker_id, episode)})
 
 
 @app.route("/api/training-segments/<int:segment_id>/status", methods=["PATCH"])

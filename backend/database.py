@@ -388,6 +388,18 @@ def replace_auto_training_segments(project_dir: str, speaker_id: int, episode: s
         conn.close()
 
 
+def clear_training_segments(project_dir: str, speaker_id: int, episode: str) -> int:
+    """Remove every merge decision for one speaker in one episode."""
+    conn = get_db(project_dir)
+    try:
+        cur = conn.execute("DELETE FROM training_segments WHERE speaker_id=? AND episode=?",
+                           (speaker_id, episode))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 def get_training_segments(project_dir: str, speaker_id: int, episode: str = "") -> list[dict]:
     conn = get_db(project_dir)
     try:

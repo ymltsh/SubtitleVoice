@@ -103,6 +103,16 @@ const store = reactive({
     await this.loadTrainingSegments();
     this.tell(result.created ? `已${regenerate ? "重新" : ""}生成 ${result.created} 个 3–10 秒合并建议` : "没有找到可安全合并为 3 秒以上的连续片段");
   },
+  async clearTrainingSegments() {
+    if (!this.currentSpeakerId || !this.currentEpisode || !this.trainingSegments.length) return;
+    if (!confirm("清空当前素材的所有合并训练片段？\n\n待确认建议和已采用的合并段都会删除；导出将恢复使用原始 Clip。")) return;
+    const result = await api(`/api/speakers/${this.currentSpeakerId}/training-segments`, {
+      method: "DELETE", body: JSON.stringify({ project: this.pid, episode: this.currentEpisode })
+    });
+    await this.loadTrainingSegments();
+    await this.loadClips();
+    this.tell(result.deleted ? `已清空 ${result.deleted} 个合并训练片段` : "没有可清空的合并训练片段");
+  },
   async updateTrainingSegmentStatus(segment, status) {
     await api(`/api/training-segments/${segment.id}/status`, { method: "PATCH", body: JSON.stringify({ project: this.pid, status }) });
     await this.loadTrainingSegments();
