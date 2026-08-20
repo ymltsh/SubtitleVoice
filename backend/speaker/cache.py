@@ -109,12 +109,16 @@ class CacheInvalidator:
 
 
 def build_wav_cache(project_dir: str, episode: str, video_path: str,
-                    progress_callback=None, include_unreviewed: bool = False) -> dict:
+                    progress_callback=None, include_unreviewed: bool = False,
+                    clip_ids: set[int] | list[int] | None = None) -> dict:
     os.makedirs(_wav_dir(project_dir), exist_ok=True)
     os.makedirs(_embedding_dir(project_dir), exist_ok=True)
     clips = get_clips(project_dir, episode)
     selected_clips = [clip for clip in clips if clip.selected_speaker_id is not None]
-    target_clips = clips  # analysis needs both positive and negative examples
+    # Feature preparation may request only reference clips from a different
+    # source video.  The normal analysis path still processes every target clip.
+    requested_ids = set(clip_ids) if clip_ids is not None else None
+    target_clips = [clip for clip in clips if requested_ids is None or clip.id in requested_ids]
     total, generated, skipped, errors = len(target_clips), 0, 0, []
     ffmpeg = get_ffmpeg_path() or "ffmpeg"
 
@@ -144,7 +148,8 @@ def build_wav_cache(project_dir: str, episode: str, video_path: str,
             "selected_clips": len(selected_clips), "unselected_clips": len(clips) - len(selected_clips)}
 
 
-def build_embedding_cache(project_dir: str, progress_callback=None) -> dict:
+def build_embedding_cache(project_dir: str, progress_callback=None,
+                          clip_ids: set[int] | list[int] | None = None) -> dict:
     from .embedding import is_encoder_available, get_encoder
     import numpy as np
     if not is_encoder_available():
@@ -154,7 +159,10 @@ def build_embedding_cache(project_dir: str, progress_callback=None) -> dict:
     # gradually by safe per-clip arrays.
     os.makedirs(_embedding_dir(project_dir), exist_ok=True)
     CacheInvalidator(project_dir)._remove(os.path.join(_embedding_dir(project_dir), LEGACY_EMBEDDING_FILE))
-    live_clips = [clip for clip in get_clips(project_dir) if os.path.isfile(get_clip_wav_path(project_dir, clip.id))]
+    requested_ids = set(clip_ids) if clip_ids is not None else None
+    live_clips = [clip for clip in get_clips(project_dir)
+                  if (requested_ids is None or clip.id in requested_ids)
+                  and os.path.isfile(get_clip_wav_path(project_dir, clip.id))]
     total = len(live_clips)
     if not total:
         return {"total": 0, "generated": 0, "skipped": 0, "errors": 0}

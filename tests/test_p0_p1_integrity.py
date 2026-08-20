@@ -2,6 +2,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from backend.database import (
     create_analysis_run,
@@ -16,6 +17,8 @@ from backend.database import (
 )
 from backend.models import Clip
 from backend.speaker.cache import get_clip_wav_path
+from backend.speaker.manager import add_reference
+from backend.speaker.features import prepare_analysis_features
 
 
 class P0P1IntegrityTests(unittest.TestCase):
@@ -67,7 +70,6 @@ class P0P1IntegrityTests(unittest.TestCase):
         self.assertFalse(os.path.exists(wav_path))
         self.assertFalse(os.path.exists(embedding_path))
         self.assertFalse(os.path.exists(score_path))
-
         # Recreate cache files, then ensure deleting/re-importing the episode
         # removes the old clip-id files as well.
         for path in (wav_path, embedding_path, score_path):
@@ -78,6 +80,32 @@ class P0P1IntegrityTests(unittest.TestCase):
         self.assertFalse(os.path.exists(wav_path))
         self.assertFalse(os.path.exists(embedding_path))
         self.assertFalse(os.path.exists(score_path))
+
+    def test_cross_episode_reference_is_prepared_before_target_analysis(self):
+        video_a = os.path.join(self.project_dir, "A.mp4")
+        video_b = os.path.join(self.project_dir, "B.mp4")
+        for path in (video_a, video_b):
+            with open(path, "wb") as file:
+                file.write(b"video")
+        conn = get_db(self.project_dir)
+        conn.execute("UPDATE clips SET episode='A' WHERE id=1")
+        conn.execute("UPDATE clips SET episode='B' WHERE id=2")
+        conn.commit()
+        conn.close()
+        add_reference(self.project_dir, self.speaker_id, 1)
+
+        wav_result = {"generated": 1, "skipped": 0, "errors": 0}
+        with patch("backend.speaker.features.build_wav_cache", return_value=wav_result) as wav_cache, \
+             patch("backend.speaker.features.build_embedding_cache", return_value={"generated": 2, "skipped": 0, "errors": 0}) as embedding_cache:
+            result = prepare_analysis_features(
+                self.project_dir, self.speaker_id, "B", {"A": video_a, "B": video_b}
+            )
+
+        self.assertEqual([call.args[1] for call in wav_cache.call_args_list], ["A", "B"])
+        self.assertEqual(wav_cache.call_args_list[0].kwargs["clip_ids"], {1})
+        self.assertEqual(wav_cache.call_args_list[1].kwargs["clip_ids"], {2})
+        self.assertEqual(embedding_cache.call_args.kwargs["clip_ids"], {1, 2})
+        self.assertEqual(result["source_episodes"], ["A", "B"])
 
 
 if __name__ == "__main__":

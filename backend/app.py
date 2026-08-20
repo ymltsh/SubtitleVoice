@@ -119,7 +119,7 @@ def _run_analysis(directory, speaker_id, episode, threshold, job_id):
     proto_key = f"{directory}:proto:{speaker_id}"
     analysis_run_id = None
     try:
-        from .speaker.cache import build_embedding_cache, build_wav_cache
+        from .speaker.features import prepare_analysis_features
         from .speaker.prototype import build_prototype
         from .speaker.retrieval import retrieve
         cfg = _read(directory)
@@ -132,14 +132,14 @@ def _run_analysis(directory, speaker_id, episode, threshold, job_id):
         ref_ver = ref_ver_row["reference_version"] if ref_ver_row else 0
         analysis_run_id = create_analysis_run(directory, speaker_id, episode, threshold, ref_ver)
         set_speaker_analysis(directory, speaker_id, episode, threshold, 0, 0, STATUS_RUNNING)
-        _set_job(key, status=STATUS_RUNNING, step="准备音频", current=0, total=1)
         _import_episode(directory, episode)
-        result = build_wav_cache(directory, episode, episode_cfg["video"],
-            progress_callback=lambda current, total, _state: _set_job(key, status=STATUS_RUNNING, step="准备音频", current=current, total=total))
-        if result.get("errors"): raise RuntimeError("部分音频缓存生成失败")
-        _set_job(key, status=STATUS_RUNNING, step="分析语音", current=0, total=1)
-        embedded = build_embedding_cache(directory)
-        if embedded.get("error"): raise RuntimeError(embedded["error"])
+        episode_videos = {item["name"]: item.get("video", "") for item in cfg.get("episodes", [])}
+        _set_job(key, status=STATUS_RUNNING, step="准备跨素材特征", current=0, total=1)
+        prepare_analysis_features(
+            directory, speaker_id, episode, episode_videos,
+            progress_callback=lambda step, current, total: _set_job(
+                key, status=STATUS_RUNNING, step=step, current=current, total=total),
+        )
         _set_job(key, status=STATUS_RUNNING, step="匹配候选", current=0, total=1)
         from .database import get_db
         conn = get_db(directory)

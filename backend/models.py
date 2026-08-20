@@ -10,6 +10,7 @@ class Clip:
     end: float = 0.0
     text: str = ""
     selected_speaker_id: Optional[int] = None
+    assignment_source: Optional[str] = None
     trim_start: float = 0.0
     trim_end: float = 0.0
 
@@ -33,6 +34,7 @@ class Clip:
             "end": round(self.end, 3),
             "text": self.text,
             "selected_speaker_id": self.selected_speaker_id,
+            "assignment_source": self.assignment_source,
             "trim_start": round(self.trim_start, 3),
             "trim_end": round(self.trim_end, 3),
             "effective_start": round(self.effective_start, 3),

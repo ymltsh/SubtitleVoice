@@ -429,6 +429,22 @@ def mark_analyses_dirty(project_dir: str, speaker_id: int, reason: str = "protot
         conn.close()
 
 
+def get_reference_clips(project_dir: str, speaker_id: int) -> list[Clip]:
+    """Return reference Clips with their source episode intact.
+
+    A speaker's voice profile is project-wide, so references are deliberately
+    not filtered to the episode currently being analysed.
+    """
+    conn = get_db(project_dir)
+    try:
+        rows = conn.execute("""SELECT c.* FROM speaker_references sr
+            JOIN clips c ON c.id=sr.clip_id
+            WHERE sr.speaker_id=? ORDER BY c.episode, c.id""", (speaker_id,)).fetchall()
+        return [Clip(**dict(row)) for row in rows]
+    finally:
+        conn.close()
+
+
 def mark_episode_analyses_dirty(project_dir: str, episode: str, reason: str = "episode_changed"):
     """Mark every completed analysis for changed episode audio as stale."""
     conn = get_db(project_dir)
